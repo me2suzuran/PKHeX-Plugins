@@ -43,7 +43,7 @@ namespace PKHeX.Core.AutoMod
         /// <param name="template">rough pkm that has all the <see cref="set"/> values entered</param>
         /// <param name="set">Showdown set object</param>
         /// <param name="satisfied">If the final result is legal or not</param>
-        public static PKM GetLegalFromTemplate(this ITrainerInfo dest, PKM template, IBattleTemplate set, IEncounterable enc, out LegalizationResult satisfied, bool nativeOnly = false)
+        public static PKM GetLegalFromTemplate(this ITrainerInfo dest, PKM template, IBattleTemplate set, IEncounterable enc, out LegalizationResult satisfied,CancellationTokenSource token, bool nativeOnly = false)
         {
             RegenSet regen;
             if (set is RegenTemplate t)
@@ -100,7 +100,7 @@ namespace PKHeX.Core.AutoMod
                 if (raw.IsEgg) // PGF events are sometimes eggs. Force hatch them before proceeding
                     raw.HandleEggEncounters(enc, tr);
 
-                raw.PreSetPIDIV(enc, set, criteria);
+                raw.PreSetPIDIV(enc, set, criteria, token);
 
                 // Transfer any VC1 via VC2, as there may be GSC exclusive moves requested.
                 if (dest.Generation >= 7 && raw is PK1 basepk1)
@@ -127,7 +127,7 @@ namespace PKHeX.Core.AutoMod
             }
 
                 // Apply final details
-                ApplySetDetails(pk, set, dest, enc, regen);
+                ApplySetDetails(pk, set, dest, enc, regen, token);
 
                 // Apply final tweaks to the data.
                 if (pk is IGigantamax gmax && gmax.CanGigantamax != set.CanGigantamax)
@@ -574,13 +574,14 @@ namespace PKHeX.Core.AutoMod
             IBattleTemplate set,
             ITrainerInfo handler,
             IEncounterable enc,
-            RegenSet regen)
+            RegenSet regen,
+            CancellationTokenSource token)
         {
             byte Form = set.Form;
             var language = regen.Extra.Language;
             var pidiv = MethodFinder.Analyze(pk);
 
-            pk.SetPINGA(set, pidiv.Type, set.HiddenPowerType, enc);
+            pk.SetPINGA(set, pidiv.Type, set.HiddenPowerType, enc, token);
             pk.SetSpeciesLevel(set, Form, enc, language);
             pk.SetDateLocks(enc);
             pk.SetHeldItem(set);
@@ -827,7 +828,8 @@ namespace PKHeX.Core.AutoMod
             IBattleTemplate set,
             PIDType method,
             int hpType,
-            IEncounterable enc)
+            IEncounterable enc,
+            CancellationTokenSource token)
         {
             var ivprop = enc.GetType().GetProperty("IVs");
             if (enc is not EncounterStatic4Pokewalker && enc.Generation > 2)
@@ -890,7 +892,7 @@ namespace PKHeX.Core.AutoMod
                     ShowdownEdits.SetEncounterTradeIVs(pk);
                     return; // Fixed PID, no need to mutate
                 default:
-                    FindPIDIV(pk, method, hpType, set.Shiny, enc, set);
+                    FindPIDIV(pk, method, hpType, set.Shiny, enc, set, token);
                     ValidateGender(pk);
                     break;
             }
@@ -928,7 +930,8 @@ namespace PKHeX.Core.AutoMod
             this PKM pk,
             IEncounterable enc,
             IBattleTemplate set,
-            EncounterCriteria criteria)
+            EncounterCriteria criteria,
+            CancellationTokenSource token)
         {
             var ivsetfor = string.Empty;
             if (enc is ITeraRaid9)
@@ -938,13 +941,13 @@ namespace PKHeX.Core.AutoMod
                 switch (enc)
                 {
                     case EncounterTera9 e:
-                        FindTeraPIDIV(pk9, e, set, criteria);
+                        FindTeraPIDIV(pk9, e, set, criteria, token);
                         break;
                     case EncounterDist9 e:
-                        FindTeraPIDIV(pk9, e, set, criteria);
+                        FindTeraPIDIV(pk9, e, set, criteria, token);
                         break;
                     case EncounterMight9 e:
-                        FindTeraPIDIV(pk9, e, set, criteria);
+                        FindTeraPIDIV(pk9, e, set, criteria, token);
                         break;
                 }
                 if (set.TeraType != MoveType.Any && set.TeraType != pk9.TeraType)
@@ -1029,7 +1032,8 @@ namespace PKHeX.Core.AutoMod
             PK9 pk,
             T enc,
             IBattleTemplate set,
-            EncounterCriteria criteria)
+            EncounterCriteria criteria,
+            CancellationTokenSource token)
             where T : ITeraRaid9, IEncounterTemplate
         {
             if (IsMatchCriteria9(pk, set, criteria))
@@ -1094,7 +1098,7 @@ namespace PKHeX.Core.AutoMod
                     break;
                 if (count == 1_000)
                     compromise = true;
-            } while (++count < 15_000);
+            } while (++count < 15_000 && !token.IsCancellationRequested);
         }
 
         /// <summary>
@@ -1334,7 +1338,8 @@ namespace PKHeX.Core.AutoMod
             int HPType,
             bool shiny,
             IEncounterable enc,
-            IBattleTemplate set)
+            IBattleTemplate set,
+            CancellationTokenSource token)
         {
             if (Method == PIDType.None)
             {
@@ -1416,7 +1421,7 @@ namespace PKHeX.Core.AutoMod
                 if (Method == PIDType.Channel && (shiny != pk.IsShiny || pidxor))
                     continue;
                 break;
-            } while (++count < 5_000_000);
+            } while (++count < 5_000_000 && !token.IsCancellationRequested);
         }
 
         private static int GetRequiredAbilityIdx(PKM pkm, IBattleTemplate set)
@@ -1704,7 +1709,8 @@ namespace PKHeX.Core.AutoMod
         public static async Task<AsyncLegalizationResult> GetLegalFromTemplateTimeout(this ITrainerInfo dest, PKM template, IBattleTemplate set, bool nativeOnly = false)
         {
             var token = new CancellationTokenSource(new TimeSpan(0, 0, 0, Timeout));
-            
+            var resetevent = new ManualResetEvent(false);
+           
             if (!EnableDevMode && ALMVersion.GetIsMismatch())
                 return new(template, LegalizationResult.VersionMismatch);
             var task = await Task.Run(async Task<AsyncLegalizationResult> () =>
@@ -1742,8 +1748,9 @@ namespace PKHeX.Core.AutoMod
                     criteria.ForceMinLevelRange = true;
                     if (regen.EncounterFilters.Count() != 0)
                         encounters = encounters.Where(enc => BatchEditing.IsFilterMatch(regen.EncounterFilters, enc));
-                    var nthreads = encounters.ToArray().Length <= 10 ? 1 : Environment.ProcessorCount;
-                    var MaxEncountersPerThread = encounters.ToArray().Length / nthreads;
+                var nthreads = encounters.ToArray().Length <= 10 ? 1 : Environment.ProcessorCount;
+                var toProcess = nthreads;
+                var MaxEncountersPerThread = encounters.ToArray().Length / nthreads;
                 var ResultLists = new List<AsyncLegalizationResult>[nthreads];
                 for (int j = 0; j < nthreads; j++)
                 {
@@ -1762,13 +1769,13 @@ namespace PKHeX.Core.AutoMod
                         {
                             Array.Copy(encounters.ToArray(), InitialEnc, ThreadEncs, 0, FinalEnc);
                         }
-                        catch (Exception) { return; }
+                        catch (Exception) { TResultList.Add(new AsyncLegalizationResult(EntityBlank.GetBlank(dest), LegalizationResult.Failed)); return; }
                         for (int h = 0; h < MaxEncountersPerThread && !token.IsCancellationRequested; h++)
                         {
                             var encount = ThreadEncs[h];
                             if (encount is null)
                                 return;
-                            var res = dest.GetLegalFromTemplate(template, set, encount, out var LR, nativeOnly);
+                            var res = dest.GetLegalFromTemplate(template, set, encount, out var LR,token, nativeOnly);
                             TResultList.Add(new AsyncLegalizationResult(res, LR));
                             if (LR == LegalizationResult.Regenerated)
                             {
@@ -1779,20 +1786,24 @@ namespace PKHeX.Core.AutoMod
                                 break;
                         }
                         ResultLists[n] = TResultList;
-                        
+                        if (Interlocked.Decrement(ref toProcess) == 0 || token.IsCancellationRequested)
+                            resetevent.Set();
                     }).Start();
                 }
+                resetevent.WaitOne();
+                await Task.Delay(300);
                 if (ResultLists.Any(z => z.Any(p => p.Status == LegalizationResult.Regenerated)))
                 {
                     var returnval = ResultLists.Where(z => z.Any(p => p.Status == LegalizationResult.Regenerated)).First();
-                    return returnval.Find(z=>z.Status == LegalizationResult.Regenerated);
+                   
+                    return returnval.Find(z=>z.Status == LegalizationResult.Regenerated)??new AsyncLegalizationResult(EntityBlank.GetBlank(dest),LegalizationResult.Failed);
                 }
                 else
                 {
                     return new AsyncLegalizationResult(EntityBlank.GetBlank(dest), LegalizationResult.Failed);
                 }
-            });
-
+            }, token.Token);
+            
             var first = task;
             if (first == null)
                 return new AsyncLegalizationResult(template, LegalizationResult.Timeout);
