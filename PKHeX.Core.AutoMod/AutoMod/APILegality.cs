@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
+using System.Reflection.Metadata.Ecma335;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -41,12 +43,7 @@ namespace PKHeX.Core.AutoMod
         /// <param name="template">rough pkm that has all the <see cref="set"/> values entered</param>
         /// <param name="set">Showdown set object</param>
         /// <param name="satisfied">If the final result is legal or not</param>
-        public static PKM GetLegalFromTemplate(
-            this ITrainerInfo dest,
-            PKM template,
-            IBattleTemplate set,
-            out LegalizationResult satisfied,
-            bool nativeOnly = false)
+        public static PKM GetLegalFromTemplate(this ITrainerInfo dest, PKM template, IBattleTemplate set, IEncounterable enc, out LegalizationResult satisfied, bool nativeOnly = false)
         {
             RegenSet regen;
             if (set is RegenTemplate t)
@@ -59,54 +56,33 @@ namespace PKHeX.Core.AutoMod
                 regen = RegenSet.Default;
             }
 
-            if (template.Version == 0)
-                template.Version = dest.Game;
-
-            template.ApplySetDetails(set);
-            template.SetRecordFlags(Array.Empty<ushort>()); // Validate TR/MS moves for the encounter
-
-            if (template.Species == (ushort)Species.Unown) // Force unown form on template
-                template.Form = set.Form;
-
             var abilityreq = GetRequestedAbility(template, set);
             var batchedit = AllowBatchCommands && regen.HasBatchSettings;
-            var native = ModLogic.cfg.NativeOnly && nativeOnly;
             var destType = template.GetType();
             var destVer = (GameVersion)dest.Game;
             if (destVer <= 0 && dest is SaveFile s)
                 destVer = s.Version;
-
             var timer = Stopwatch.StartNew();
-            var gamelist = FilteredGameList(template, destVer, AllowBatchCommands, set, native);
-            if (dest.Generation <= 2)
-                template.EXP = 0; // no relearn moves in gen 1/2 so pass level 1 to generator
-
-            var encounters = GetAllEncounters(
-                pk: template,
-                moves: new ReadOnlyMemory<ushort>(set.Moves),
-                gamelist
-            );
             var criteria = EncounterCriteria.GetCriteria(set, template.PersonalInfo);
             criteria.ForceMinLevelRange = true;
-            if (regen.EncounterFilters.Count() != 0)
-                encounters = encounters.Where(
-                    enc => BatchEditing.IsFilterMatch(regen.EncounterFilters, enc)
-                );
+  
 
             PKM? last = null;
-            foreach (var enc in encounters)
+          
+            // Return out if set times out
+            if (timer.Elapsed.TotalSeconds >= Timeout)
             {
-                // Return out if set times out
-                if (timer.Elapsed.TotalSeconds >= Timeout)
-                {
-                    timer.Stop();
-                    satisfied = LegalizationResult.Timeout;
-                    return template;
-                }
+                timer.Stop();
+                satisfied = LegalizationResult.Timeout;
+                return template;
+            }
 
-                // Look before we leap -- don't waste time generating invalid / incompatible junk.
-                if (!IsEncounterValid(set, enc, abilityreq, destVer))
-                    continue;
+            // Look before we leap -- don't waste time generating invalid / incompatible junk.
+            if (!IsEncounterValid(set, enc, abilityreq, destVer))
+            {
+                satisfied = LegalizationResult.Failed;
+                return last ?? template;
+            }
 
                 if (enc is IFixedNature { IsFixedNature: true } fixedNature)
                     criteria = criteria with { Nature = Nature.Random };
@@ -132,14 +108,23 @@ namespace PKHeX.Core.AutoMod
 
                 // Bring to the target generation and filter
                 var pk = EntityConverter.ConvertToType(raw, destType, out _);
-                if (pk == null)
-                    continue;
-                if (EntityConverter.IsIncompatibleGB(pk, template.Japanese, pk.Japanese))
-                    continue;
+            if (pk == null)
+            {
+                satisfied = LegalizationResult.Failed;
+                return last ?? template;
+            }
+            if (EntityConverter.IsIncompatibleGB(pk, template.Japanese, pk.Japanese))
+            {
+                satisfied = LegalizationResult.Failed;
+                return last ?? template;
+            }
 
                 pk = pk.Clone(); // Handle Nickname-Trash issues (weedle word filter)
-                if (HomeTrackerUtil.IsRequired(enc, pk) && !AllowHOMETransferGeneration)
-                    continue;
+            if (HomeTrackerUtil.IsRequired(enc, pk) && !AllowHOMETransferGeneration)
+            {
+                satisfied = LegalizationResult.Failed;
+                return last ?? template;
+            }
 
                 // Apply final details
                 ApplySetDetails(pk, set, dest, enc, regen);
@@ -147,8 +132,11 @@ namespace PKHeX.Core.AutoMod
                 // Apply final tweaks to the data.
                 if (pk is IGigantamax gmax && gmax.CanGigantamax != set.CanGigantamax)
                 {
-                    if (!Gigantamax.CanToggle(pk.Species, pk.Form, enc.Species, enc.Form))
-                        continue;
+                if (!Gigantamax.CanToggle(pk.Species, pk.Form, enc.Species, enc.Form))
+                {
+                    satisfied = LegalizationResult.Failed;
+                    return last ?? template;
+                }
                     gmax.CanGigantamax = set.CanGigantamax; // soup hax
                 }
 
@@ -160,8 +148,11 @@ namespace PKHeX.Core.AutoMod
                     BatchEditing.ScreenStrings(b.Filters);
                     BatchEditing.ScreenStrings(b.Instructions);
                     var modified = BatchEditing.TryModify(pk, b.Filters, b.Instructions);
-                    if (!modified && b.Filters.Count > 0)
-                        continue;
+                if (!modified && b.Filters.Count > 0)
+                {
+                    satisfied = LegalizationResult.Failed;
+                    return last ?? template;
+                }
                     pk.ApplyPostBatchFixes();
                 }
 
@@ -179,16 +170,12 @@ namespace PKHeX.Core.AutoMod
                 }
                 last = pk;
                 Debug.WriteLine($"{la.Report()}\n");
-            }
+            
             satisfied = LegalizationResult.Failed;
             return last ?? template;
         }
 
-        private static PKM GetPokemonFromEncounter(
-            this IEncounterable enc,
-            ITrainerInfo tr,
-            EncounterCriteria criteria,
-            IBattleTemplate set)
+        private static PKM GetPokemonFromEncounter(this IEncounterable enc, ITrainerInfo tr, EncounterCriteria criteria, IBattleTemplate set)
         {
             var basepkm = enc.ConvertToPKM(tr, criteria);
 
@@ -203,10 +190,7 @@ namespace PKHeX.Core.AutoMod
             return basepkm;
         }
 
-        private static IEnumerable<IEncounterable> GetAllEncounters(
-            PKM pk,
-            ReadOnlyMemory<ushort> moves,
-            IReadOnlyList<GameVersion> vers)
+        private static IEnumerable<IEncounterable> GetAllEncounters(PKM pk, ReadOnlyMemory<ushort> moves, IReadOnlyList<GameVersion> vers)
         {
             var orig_encs = EncounterMovesetGenerator.GenerateEncounters(pk, moves, vers);
             foreach (var enc in orig_encs)
@@ -1717,35 +1701,99 @@ namespace PKHeX.Core.AutoMod
         /// <summary>
         /// Wrapper function for GetLegalFromTemplate but with a Timeout
         /// </summary>
-        public static AsyncLegalizationResult GetLegalFromTemplateTimeout(
-            this ITrainerInfo dest,
-            PKM template,
-            IBattleTemplate set,
-            bool nativeOnly = false)
+        public static async Task<AsyncLegalizationResult> GetLegalFromTemplateTimeout(this ITrainerInfo dest, PKM template, IBattleTemplate set, bool nativeOnly = false)
         {
-            AsyncLegalizationResult GetLegal()
+            var token = new CancellationTokenSource(new TimeSpan(0, 0, 0, Timeout));
+            
+            if (!EnableDevMode && ALMVersion.GetIsMismatch())
+                return new(template, LegalizationResult.VersionMismatch);
+            var task = await Task.Run(async Task<AsyncLegalizationResult> () =>
             {
-                try
-                {
-                    if (!EnableDevMode && ALMVersion.GetIsMismatch())
-                        return new(template, LegalizationResult.VersionMismatch);
+               
+                RegenSet regen;
+                    if (set is RegenTemplate t)
+                    {
+                        t.FixGender(template.PersonalInfo);
+                        regen = t.Regen;
+                    }
+                    else
+                    {
+                        regen = RegenSet.Default;
+                    }
 
-                    var res = dest.GetLegalFromTemplate(
-                        template,
-                        set,
-                        out var s,
-                        nativeOnly
-                    );
-                    return new AsyncLegalizationResult(res, s);
-                }
-                catch (MissingMethodException)
-                {
-                    return new AsyncLegalizationResult(template, LegalizationResult.VersionMismatch);
-                }
-            }
+                    if (template.Version == 0)
+                        template.Version = dest.Game;
 
-            var task = Task.Run(GetLegal);
-            var first = task.TimeoutAfter(new TimeSpan(0, 0, 0, Timeout))?.Result;
+                    template.ApplySetDetails(set);
+                    template.SetRecordFlags(Array.Empty<ushort>()); // Validate TR/MS moves for the encounter
+
+                    if (template.Species == (ushort)Species.Unown) // Force unown form on template
+                        template.Form = set.Form;
+                    var native = ModLogic.cfg.NativeOnly && nativeOnly;
+                    var destVer = (GameVersion)dest.Game;
+                    if (destVer <= 0 && dest is SaveFile s)
+                        destVer = s.Version;
+                    var gamelist = FilteredGameList(template, destVer, AllowBatchCommands, set, native);
+                    if (dest.Generation <= 2)
+                        template.EXP = 0; // no relearn moves in gen 1/2 so pass level 1 to generator
+
+                    var encounters = GetAllEncounters(pk: template, moves: new ReadOnlyMemory<ushort>(set.Moves), gamelist);
+                    var criteria = EncounterCriteria.GetCriteria(set, template.PersonalInfo);
+                    criteria.ForceMinLevelRange = true;
+                    if (regen.EncounterFilters.Count() != 0)
+                        encounters = encounters.Where(enc => BatchEditing.IsFilterMatch(regen.EncounterFilters, enc));
+                    var nthreads = encounters.ToArray().Length <= 10 ? 1 : Environment.ProcessorCount;
+                    var MaxEncountersPerThread = encounters.ToArray().Length / nthreads;
+                var ResultLists = new List<AsyncLegalizationResult>[nthreads];
+                for (int j = 0; j < nthreads; j++)
+                {
+                    var n = j;
+                    new Thread(delegate ()
+                    {
+
+                        var TResultList = new List<AsyncLegalizationResult>();
+
+                        var InitialEnc = MaxEncountersPerThread * n;
+                        var FinalEnc = (n < nthreads - 1 && InitialEnc + MaxEncountersPerThread < encounters.ToArray().Length) ? MaxEncountersPerThread : encounters.ToArray().Length;
+                        IEncounterable[] ThreadEncs = new IEncounterable[MaxEncountersPerThread];
+                        if (encounters.ToArray().Length == 0)
+                            return;
+                        try
+                        {
+                            Array.Copy(encounters.ToArray(), InitialEnc, ThreadEncs, 0, FinalEnc);
+                        }
+                        catch (Exception) { return; }
+                        for (int h = 0; h < MaxEncountersPerThread && !token.IsCancellationRequested; h++)
+                        {
+                            var encount = ThreadEncs[h];
+                            if (encount is null)
+                                return;
+                            var res = dest.GetLegalFromTemplate(template, set, encount, out var LR, nativeOnly);
+                            TResultList.Add(new AsyncLegalizationResult(res, LR));
+                            if (LR == LegalizationResult.Regenerated)
+                            {
+                                token.Cancel();
+                                break;
+                            }
+                            if (token.IsCancellationRequested)
+                                break;
+                        }
+                        ResultLists[n] = TResultList;
+                        
+                    }).Start();
+                }
+                if (ResultLists.Any(z => z.Any(p => p.Status == LegalizationResult.Regenerated)))
+                {
+                    var returnval = ResultLists.Where(z => z.Any(p => p.Status == LegalizationResult.Regenerated)).First();
+                    return returnval.Find(z=>z.Status == LegalizationResult.Regenerated);
+                }
+                else
+                {
+                    return new AsyncLegalizationResult(EntityBlank.GetBlank(dest), LegalizationResult.Failed);
+                }
+            });
+
+            var first = task;
             if (first == null)
                 return new AsyncLegalizationResult(template, LegalizationResult.Timeout);
 
@@ -1769,9 +1817,7 @@ namespace PKHeX.Core.AutoMod
             }
         }
 
-        private static async Task<AsyncLegalizationResult?>? TimeoutAfter(
-            this Task<AsyncLegalizationResult> task,
-            TimeSpan timeout)
+        private static async Task<AsyncLegalizationResult?>? TimeoutAfter(this Task<AsyncLegalizationResult> task, TimeSpan timeout)
         {
             using var cts = new CancellationTokenSource(timeout);
             var delay = Task.Delay(timeout, cts.Token);

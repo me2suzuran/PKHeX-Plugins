@@ -33,7 +33,7 @@ namespace PKHeX.Core.AutoMod
         public static PKM Legalize(this ITrainerInfo tr, PKM pk)
         {
             var set = new RegenTemplate(pk, tr.Generation);
-            var almres = tr.GetLegalFromTemplateTimeout(pk, set);
+            var almres = tr.GetLegalFromTemplateTimeout(pk, set).Result;
             if (almres.Status == LegalizationResult.VersionMismatch)
                 throw new MissingMethodException("PKHeX and Plugins have a version mismatch");
             return almres.Created;
@@ -242,7 +242,7 @@ namespace PKHeX.Core.AutoMod
             bool nativeOnly = false
         )
         {
-            var almres = tr.GetLegalFromTemplateTimeout(template, set, nativeOnly);
+            var almres = tr.GetLegalFromTemplateTimeout(template, set, nativeOnly).Result;
             if (almres.Status != LegalizationResult.Regenerated)
                 return almres;
 
